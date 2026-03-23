@@ -1,0 +1,7 @@
+name: opencode
+version: 1.0.0
+description: Dispatch coding tasks to OpenCode's multi-agent harness (oh-my-opencode)
+author: zaycruz
+provides_tools:
+  - opencode
+provides_hooks: []
