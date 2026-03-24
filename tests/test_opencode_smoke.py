@@ -6,11 +6,11 @@ bypassing the Hermes agent loop. Each test gets an isolated git-initialized
 temp directory.
 
 Run:
-    cd /Users/master/.hermes/hermes-agent
-    python -m pytest tests/integration/test_opencode_smoke.py -v -x --timeout=600
+    cd hermes-opencode-plugin
+    python -m pytest tests/test_opencode_smoke.py -v -x
 
 Fast subset:
-    python -m pytest tests/integration/test_opencode_smoke.py -v -k "status or missing_prompt or timeout" --timeout=30
+    python -m pytest tests/test_opencode_smoke.py -v -k "status or missing_prompt or timeout"
 """
 
 import json
@@ -21,10 +21,17 @@ import sys
 
 import pytest
 
-# Ensure hermes-agent is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+# Support running from both the standalone plugin repo and inside hermes-agent
+_plugin_root = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, _plugin_root)
 
-from tools.opencode_tool import opencode_handler, check_opencode_requirements
+try:
+    # Standalone plugin repo: import directly from opencode_tool.py
+    from opencode_tool import opencode_handler, check_opencode_requirements
+except ImportError:
+    # Inside hermes-agent tree: import from tools package
+    sys.path.insert(0, os.path.join(_plugin_root, ".."))
+    from tools.opencode_tool import opencode_handler, check_opencode_requirements
 
 
 # ---------------------------------------------------------------------------
