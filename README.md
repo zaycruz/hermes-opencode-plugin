@@ -24,8 +24,19 @@ One `opencode` call can trigger 5+ agents running in parallel across multiple mo
 ## Requirements
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed and running
-- [OpenCode](https://opencode.ai/) CLI installed (`opencode` on PATH)
-- [oh-my-opencode](https://github.com/code-yeongyu/oh-my-openagent) plugin configured in OpenCode
+- [OpenCode](https://opencode.ai/) CLI installed (`opencode` on PATH), version **≥ 1.4.0**
+- [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent) (formerly *oh-my-opencode*, "OMO") — provides the Sisyphus / Hephaestus / Oracle / Atlas / Prometheus agents.
+  Install it via its own installer, **not** a bare `opencode.json` plugin entry:
+
+  ```bash
+  bunx oh-my-openagent install
+  bunx oh-my-openagent doctor   # verify the agents resolved
+  ```
+
+  > **OMO is optional.** If it's missing or only half-installed, the plugin detects the
+  > missing default agent and automatically falls back to OpenCode's built-in `build`
+  > agent, so `run` still works (without the multi-agent orchestration). Use the
+  > `agents` action to see what's actually installed.
 
 ## Install
 
@@ -70,8 +81,18 @@ Hermes (internally):
 |--------|-------------|
 | `run` | Fire-and-forget coding task. Returns structured results. |
 | `session` | Send a message to an existing session (multi-turn work). |
-| `status` | Check if OpenCode CLI is available. |
+| `status` | Check CLI availability, whether oh-my-openagent is installed, and agent count. |
+| `agents` | List the agents the local OpenCode install knows about (discovery). |
 | `stop` | Stop the OpenCode background server. |
+
+### Headless / no browser
+
+Hermes drives OpenCode non-interactively, so every OpenCode process the plugin
+spawns runs with the embedded web UI, session sharing, and auto-update disabled
+(`OPENCODE_DISABLE_EMBEDDED_WEB_UI`, `OPENCODE_DISABLE_SHARE`,
+`OPENCODE_DISABLE_AUTOUPDATE`). This prevents OpenCode from opening a browser tab
+on each invocation. Operators can still override these by exporting them
+themselves.
 
 ### Agent Selection
 
