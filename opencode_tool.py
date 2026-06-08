@@ -37,6 +37,37 @@ DEFAULT_TIMEOUT = 600       # 10 minutes
 DEFAULT_SERVER_PORT = 4096
 SERVER_STARTUP_WAIT = 2     # seconds to wait for server to bind
 
+# Built-in agent that always ships with the opencode CLI itself (no plugins
+# required). Used as a safety net when the user's configured default agent —
+# typically an oh-my-opencode agent like "Sisyphus - Ultraworker" — is missing.
+FALLBACK_AGENT = "build"
+
+# Environment overrides applied to every opencode subprocess we spawn. Hermes
+# drives opencode headlessly, so opencode must never try to pop a browser tab
+# (embedded web UI), auto-share a session, or auto-update mid-run. Without these
+# the embedded web UI opens a browser on every launch. Callers' existing env is
+# preserved; these keys are only set if not already present so an operator can
+# still override them.
+_HEADLESS_ENV = {
+    "OPENCODE_DISABLE_EMBEDDED_WEB_UI": "1",  # the browser-tab culprit
+    "OPENCODE_DISABLE_SHARE": "1",            # never auto-share / open share URL
+    "OPENCODE_AUTO_SHARE": "0",
+    "OPENCODE_DISABLE_AUTOUPDATE": "1",       # don't self-update during a task
+    "BROWSER": "true",                         # no-op opener as a belt-and-braces fallback
+}
+
+
+def _child_env() -> Dict[str, str]:
+    """Return a copy of os.environ with headless/no-browser defaults applied.
+
+    Only fills keys the caller hasn't already set, so explicit operator settings
+    win.
+    """
+    env = dict(os.environ)
+    for key, value in _HEADLESS_ENV.items():
+        env.setdefault(key, value)
+    return env
+
 # Output truncation limits
 MAX_TEXT_LENGTH = 5000
 MAX_TOOL_OUTPUT_LENGTH = 2000
@@ -71,6 +102,48 @@ _opencode_server_lock = threading.Lock()
 def check_opencode_requirements() -> bool:
     """Check if the opencode CLI is installed and available."""
     return shutil.which("opencode") is not None
+
+
+def _list_agents(timeout: int = 15) -> List[str]:
+    """Return the names of agents the local opencode install knows about.
+
+    Parses `opencode agent list`. Best-effort: returns an empty list if the CLI
+    is missing, errors, or the output can't be parsed. Used for discovery and to
+    report whether the oh-my-opencode harness is installed.
+    """
+    if not check_opencode_requirements():
+        return []
+    try:
+        result = subprocess.run(
+            ["opencode", "agent", "list"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_child_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+
+    agents: List[str] = []
+    for line in result.stdout.splitlines():
+        # Lines look like: "build (subagent)" / "Sisyphus - Ultraworker (primary)".
+        # Strip zero-width spaces opencode uses for indentation, then take the
+        # text before the trailing "(role)" marker.
+        line = line.replace("​", "").strip()
+        if not line or "(" not in line:
+            continue
+        name = line.rsplit("(", 1)[0].strip()
+        if name and name not in agents:
+            agents.append(name)
+    return agents
+
+
+def _omo_installed(agents: Optional[List[str]] = None) -> bool:
+    """Heuristic: is the oh-my-opencode agent harness installed?"""
+    if agents is None:
+        agents = _list_agents()
+    lowered = " ".join(agents).lower()
+    return any(name in lowered for name in ("sisyphus", "hephaestus", "prometheus"))
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +193,26 @@ def _sanitize_stderr(stderr: str) -> str:
     return stderr[:MAX_STDERR_LENGTH] if stderr else ""
 
 
+def _is_missing_default_agent_error(returncode: int, stdout: str, stderr: str) -> bool:
+    """Detect the 'configured default agent is not installed' failure.
+
+    When oh-my-opencode is not fully installed but the opencode config still
+    points its default agent at one of OMO's agents (e.g. "Sisyphus -
+    Ultraworker"), `opencode run` exits non-zero with a message like:
+
+        Error: default agent "Sisyphus - Ultraworker" not found
+
+    Note: a *missing --agent we passed explicitly* is NOT this case — opencode
+    just warns ("agent X not found. Falling back to default agent") and still
+    succeeds. We only treat a hard non-zero exit with a "not found" agent
+    message as recoverable via the built-in fallback agent.
+    """
+    if returncode == 0:
+        return False
+    blob = f"{stdout}\n{stderr}".lower()
+    return "not found" in blob and "agent" in blob
+
+
 # ---------------------------------------------------------------------------
 # Server management (for session mode)
 # ---------------------------------------------------------------------------
@@ -143,6 +236,7 @@ def _start_server(port: int = DEFAULT_SERVER_PORT) -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             process_group=0,  # safe replacement for preexec_fn=os.setsid
+            env=_child_env(),
         )
 
         # Give it a moment to bind
@@ -332,45 +426,83 @@ def _run_task(
     files: Optional[List[str]] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Dict[str, Any]:
-    """Execute a task via `opencode run` and return structured results."""
+    """Execute a task via `opencode run` and return structured results.
 
-    cmd = ["opencode", "run", "--format", "json"]
+    If the caller did not request a specific agent and the run fails because the
+    user's configured default agent is missing (the classic half-installed
+    oh-my-opencode case), the task is retried once with the built-in fallback
+    agent so Hermes still gets a result instead of an opaque error.
+    """
 
-    if directory:
-        cmd.extend(["--dir", directory])
-    if agent:
-        cmd.extend(["--agent", agent])
-    if model:
-        cmd.extend(["--model", model])
-    if variant:
-        cmd.extend(["--variant", variant])
-    if session_id:
-        cmd.extend(["--session", session_id])
-    if files:
-        for f in files:
-            cmd.extend(["--file", f])
+    def _build_cmd(agent_override: Optional[str]) -> List[str]:
+        cmd = ["opencode", "run", "--format", "json"]
+        if directory:
+            cmd.extend(["--dir", directory])
+        if agent_override:
+            cmd.extend(["--agent", agent_override])
+        if model:
+            cmd.extend(["--model", model])
+        if variant:
+            cmd.extend(["--variant", variant])
+        if session_id:
+            cmd.extend(["--session", session_id])
+        if files:
+            for f in files:
+                cmd.extend(["--file", f])
+        cmd.append("--")
+        cmd.append(prompt)
+        return cmd
 
-    cmd.append("--")
-    cmd.append(prompt)
-
-    logger.info("Running opencode task (timeout=%ds)", timeout)
-
-    try:
-        result = subprocess.run(
+    def _exec(cmd: List[str]):
+        return subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=directory or os.getcwd(),
+            env=_child_env(),
         )
+
+    logger.info("Running opencode task (timeout=%ds, agent=%s)", timeout, agent or "<default>")
+
+    try:
+        result = _exec(_build_cmd(agent))
     except subprocess.TimeoutExpired:
         return {
             "status": "timeout",
             "error": f"Task timed out after {timeout}s",
         }
 
+    fell_back = False
+    # Only auto-fall-back when the caller did NOT pin an agent: if they asked for
+    # a specific agent we surface the error rather than silently swapping it.
+    if not agent and _is_missing_default_agent_error(
+        result.returncode, result.stdout, result.stderr
+    ):
+        logger.warning(
+            "Default opencode agent is missing (oh-my-opencode not installed?); "
+            "retrying with built-in '%s' agent.", FALLBACK_AGENT,
+        )
+        try:
+            result = _exec(_build_cmd(FALLBACK_AGENT))
+            fell_back = True
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "timeout",
+                "error": f"Task timed out after {timeout}s (fallback agent)",
+            }
+
     parsed = _parse_event_stream(result.stdout)
-    return _build_response(parsed, result.returncode, result.stdout, result.stderr)
+    response = _build_response(parsed, result.returncode, result.stdout, result.stderr)
+    if fell_back:
+        response["agent_used"] = FALLBACK_AGENT
+        response["note"] = (
+            "Configured default agent was unavailable (oh-my-opencode not "
+            f"installed); used built-in '{FALLBACK_AGENT}' agent instead. "
+            "Install oh-my-opencode for the full Sisyphus/Hephaestus harness: "
+            "https://github.com/zaycruz/oh-my-opencode"
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +548,7 @@ def _session_prompt(
             text=True,
             timeout=timeout,
             cwd=directory or os.getcwd(),
+            env=_child_env(),
         )
     except subprocess.TimeoutExpired:
         return {
@@ -483,16 +616,28 @@ def opencode_handler(args: Dict[str, Any], **kwargs) -> str:
             )
             return json.dumps(result, ensure_ascii=False, default=str)
 
+        elif action == "agents":
+            agents = _list_agents()
+            return json.dumps({
+                "opencode_available": check_opencode_requirements(),
+                "agents": agents,
+                "oh_my_opencode_installed": _omo_installed(agents),
+                "fallback_agent": FALLBACK_AGENT,
+            })
+
         elif action == "status":
             with _opencode_server_lock:
                 running = (
                     _opencode_server_process is not None
                     and _opencode_server_process.poll() is None
                 )
+            agents = _list_agents()
             return json.dumps({
                 "server_running": running,
                 "port": _opencode_server_port if running else None,
                 "opencode_available": check_opencode_requirements(),
+                "oh_my_opencode_installed": _omo_installed(agents),
+                "agent_count": len(agents),
             })
 
         elif action == "stop":
@@ -500,7 +645,7 @@ def opencode_handler(args: Dict[str, Any], **kwargs) -> str:
             return json.dumps({"status": "stopped"})
 
         else:
-            return json.dumps({"error": f"Unknown action: {action}. Use: run, session, status, stop"})
+            return json.dumps({"error": f"Unknown action: {action}. Use: run, session, status, agents, stop"})
 
     except Exception as e:
         logger.exception("opencode tool error")
@@ -526,12 +671,13 @@ OPENCODE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["run", "session", "status", "stop"],
+                "enum": ["run", "session", "status", "agents", "stop"],
                 "description": (
                     "Action to perform. "
                     "'run': Execute a one-shot coding task (fire-and-forget, starts its own session). "
                     "'session': Send a message to an existing managed session (for multi-turn work). "
-                    "'status': Check if OpenCode server is running. "
+                    "'status': Check if OpenCode server is running and whether oh-my-opencode is installed. "
+                    "'agents': List the agents the local opencode install knows about (discovery). "
                     "'stop': Stop the OpenCode server."
                 ),
                 "default": "run",
@@ -556,12 +702,16 @@ OPENCODE_SCHEMA = {
             "agent": {
                 "type": "string",
                 "description": (
-                    "OpenCode agent to use. Common agents: "
-                    "'sisyphus' (main orchestrator, delegates to specialists), "
-                    "'atlas' (todo-driven orchestrator), "
-                    "'hephaestus' (deep autonomous worker for complex tasks), "
-                    "'prometheus' (strategic planner, interviews before coding). "
-                    "Leave empty to use the default agent."
+                    "OpenCode agent to use. The orchestrator agents are provided by "
+                    "oh-my-opencode and use full display names: "
+                    "'Sisyphus - Ultraworker' (main orchestrator, delegates to specialists), "
+                    "'Atlas - Plan Executor' (todo-driven orchestrator), "
+                    "'Hephaestus - Deep Agent' (deep autonomous worker), "
+                    "'Prometheus - Plan Builder' (strategic planner). "
+                    "Built-in agents that need no plugins: 'build', 'plan', 'general', 'explore'. "
+                    "Leave empty to use opencode's configured default. If the default is a "
+                    "missing oh-my-opencode agent, the tool auto-falls-back to 'build'. "
+                    "Call action='agents' to list what is actually installed."
                 ),
             },
             "model": {
