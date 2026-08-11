@@ -1,3 +1,5 @@
+
+
 # hermes-opencode-plugin
 
 OpenCode integration plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Dispatch software engineering tasks to [OpenCode](https://opencode.ai/)'s multi-agent harness ([oh-my-opencode](https://github.com/code-yeongyu/oh-my-openagent)).
@@ -89,7 +91,7 @@ Hermes (internally):
 
 Hermes drives OpenCode non-interactively, so every OpenCode process the plugin
 spawns runs with the embedded web UI, session sharing, and auto-update disabled
-(`OPENCODE_DISABLE_EMBEDDED_WEB_UI`, `OPENCODE_DISABLE_SHARE`,
+(`OPENCODE_DISABLE_EMBEDDED_WEB_UI`, `OPENCODE_DISABLE_SHARE`, `OPENCODE_AUTO_SHARE`,
 `OPENCODE_DISABLE_AUTOUPDATE`). This prevents OpenCode from opening a browser tab
 on each invocation. Operators can still override these by exporting them
 themselves.
