@@ -68,6 +68,21 @@ def _child_env() -> Dict[str, str]:
         env.setdefault(key, value)
     return env
 
+
+def _remote_server_url() -> Optional[str]:
+    """Return ``OPENCODE_SERVER_URL`` when set, otherwise ``None``.
+
+    When it is set, every command below runs as a thin client against that
+    server (``--attach``) instead of spawning a local child process, so the
+    agent's memory belongs to the server's container, not to ours. A heavy run
+    can then no longer OOM-kill the process that is orchestrating it.
+
+    Unset is the original behaviour: spawn a local server / child, i.e. fully
+    backwards compatible.
+    """
+    url = os.environ.get("OPENCODE_SERVER_URL", "").strip()
+    return url.rstrip("/") or None
+
 # Output truncation limits
 MAX_TEXT_LENGTH = 5000
 MAX_TOOL_OUTPUT_LENGTH = 2000
@@ -434,8 +449,16 @@ def _run_task(
     agent so Hermes still gets a result instead of an opaque error.
     """
 
-    def _build_cmd(agent_override: Optional[str]) -> List[str]:
+    def _build_cmd(
+        agent_override: Optional[str], use_remote: bool = True
+    ) -> List[str]:
         cmd = ["opencode", "run", "--format", "json"]
+        remote = _remote_server_url() if use_remote else None
+        if remote:
+            # Run the task on the server instead of spawning a local child:
+            # this is the difference between the agent's memory being the
+            # gateway's memory and being its own budget.
+            cmd.extend(["--attach", remote])
         if directory:
             cmd.extend(["--dir", directory])
         if agent_override:
@@ -502,6 +525,46 @@ def _run_task(
             "Install oh-my-opencode for the full Sisyphus/Hephaestus harness: "
             "https://github.com/zaycruz/oh-my-opencode"
         )
+
+    # Remote-server guard. `opencode run --attach` has been observed to hand the
+    # prompt to the server and return a single `step_start` event with no
+    # assistant text, while the run itself completed server-side. Reporting an
+    # empty result as success would make a dispatch look like it did nothing,
+    # so an empty attach result is retried against a local child process. The
+    # task may then run twice (the server copy already started) — a duplicate
+    # run is recoverable, a silently swallowed one is not.
+    if _remote_server_url() and not parsed.get("text_parts") and not parsed.get(
+        "tool_results"
+    ):
+        logger.warning(
+            "Remote opencode server returned no result (attached run); "
+            "retrying locally so the task is not silently lost."
+        )
+        try:
+            local_result = _exec(_build_cmd(agent, use_remote=False))
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "timeout",
+                "error": (
+                    f"Remote server returned no result and the local retry "
+                    f"timed out after {timeout}s"
+                ),
+            }
+        local_parsed = _parse_event_stream(local_result.stdout)
+        if local_parsed.get("text_parts") or local_parsed.get("tool_results"):
+            response = _build_response(
+                local_parsed, local_result.returncode, local_result.stdout,
+                local_result.stderr,
+            )
+            response["note"] = (
+                "The remote opencode server returned no result; this ran as a "
+                "local child process instead. Session may also exist server-side."
+            )
+        else:
+            response["note"] = (
+                "Neither the remote opencode server nor the local fallback "
+                "returned a result."
+            )
     return response
 
 
@@ -521,8 +584,11 @@ def _session_prompt(
 
     Returns the same structured format as _run_task for consistency.
     """
-    port = _start_server()
-    attach_url = f"http://localhost:{port}"
+    attach_url = _remote_server_url()
+    if not attach_url:
+        # No remote server configured — start a local one (original behaviour).
+        port = _start_server()
+        attach_url = f"http://localhost:{port}"
 
     cmd = [
         "opencode", "run",
