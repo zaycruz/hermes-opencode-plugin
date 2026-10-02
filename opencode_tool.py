@@ -23,6 +23,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -104,15 +105,120 @@ def check_opencode_requirements() -> bool:
     return shutil.which("opencode") is not None
 
 
+def _query_agents_json(argv: List[str], timeout: int) -> List[str]:
+    """Run an agent-listing command that emits JSON. Returns [] on any failure.
+
+    Writes stdout to a temp FILE rather than ``subprocess.PIPE`` on purpose. On
+    opencode 2.0.20, ``opencode debug agents`` emits ~360 KB of JSON and
+    truncates at exactly 327680 bytes (320 KiB) when stdout is a pipe, cutting
+    mid-string so ``json.loads()`` raises and discovery falsely reports "0
+    agents" against a perfectly healthy install. Redirecting to a regular file
+    returns the complete document.
+    """
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="opencode-agents-", suffix=".json")
+        os.close(fd)
+        with open(tmp, "w") as fh:
+            proc = subprocess.run(
+                argv,
+                stdout=fh,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+                env=_child_env(),
+            )
+        if proc.returncode != 0:
+            return []
+        with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return list(dict.fromkeys(
+        str(a["id"]) for a in data if isinstance(a, dict) and a.get("id")
+    ))
+
+
+def _parse_agent_list_text(stdout: str) -> List[str]:
+    """Parse the legacy ``opencode agent list`` text output (opencode 1.x).
+
+    Rows look like "build (subagent)" / "Sisyphus - Ultraworker (primary)": a
+    display name followed by a bare role token in parentheses. The parser is
+    deliberately strict so that `opencode agent list` printing its *help text*
+    (which is what it does on opencode 2.x, with exit code 0) is rejected rather
+    than scraped into bogus "agents" — help rows end in "(optional)",
+    "(choices: ...)", "(server logs require --standalone)", etc.
+    """
+    agents: List[str] = []
+    for line in (stdout or "").splitlines():
+        # opencode uses zero-width spaces for indentation in this listing.
+        line = line.replace("\u200b", "").strip()
+        if not line.endswith(")") or "(" not in line:
+            continue
+        head, _, role = line.rpartition("(")
+        role = role[:-1].strip().lower()
+        # A real row's role is a bare word ("primary", "subagent"). Help rows end
+        # in "(optional)", "(choices: ...)", "(bash|zsh)", "(<directory>)" etc.
+        if (not role or " " in role or ":" in role or "--" in role
+                or "." in role or "|" in role or "<" in role or ">" in role):
+            continue
+        if role in {"optional", "required", "default", "deprecated", "repeatable"}:
+            continue
+        name = head.strip()
+        # Help rows carry a wide gutter ("directory string    Directory to ...");
+        # agent names do not, and are short.
+        if "  " in name or len(name) > 48:
+            continue
+        if name and name not in agents:
+            agents.append(name)
+    return agents
+
+
+# Agent ids shipped by an oh-my-opencode (OMO) harness. Matched against the
+# first token of each discovered agent name, because the JSON path (2.x) yields
+# bare ids ("orchestrator") while the legacy text path (1.x) yields decorated
+# names ("Sisyphus - Ultraworker"). Covers the current oh-my-opencode-slim team
+# and the legacy oh-my-openagent names it replaced.
+_OMO_AGENT_IDS = frozenset({
+    "orchestrator", "oracle", "librarian", "explorer", "designer", "fixer",
+    "sisyphus", "hephaestus", "prometheus",
+})
+
+
 def _list_agents(timeout: int = 15) -> List[str]:
     """Return the names of agents the local opencode install knows about.
 
-    Parses `opencode agent list`. Best-effort: returns an empty list if the CLI
-    is missing, errors, or the output can't be parsed. Used for discovery and to
-    report whether the oh-my-opencode harness is installed.
+    Prefers ``opencode debug agents`` (opencode 2.x, JSON) and falls back to the
+    legacy ``opencode agent list`` (1.x, text). Best-effort: returns an empty
+    list if the CLI is missing, errors, or the output can't be parsed. Used for
+    discovery and to report whether an oh-my-opencode harness is installed.
     """
     if not check_opencode_requirements():
         return []
+    # The 2.x service registers agents asynchronously, so `debug agents` can
+    # return an empty list for a moment after the service starts. Retry briefly
+    # before concluding "0 agents" against a healthy install.
+    for _ in range(3):
+        names = _query_agents_json(["opencode", "debug", "agents"], timeout)
+        if names:
+            return names
+        time.sleep(1.0)
+    # Legacy opencode 1.x path. On 2.x this subcommand prints help text when the
+    # JSON path found nothing; the strict parser discards it.
     try:
         result = subprocess.run(
             ["opencode", "agent", "list"],
@@ -123,32 +229,24 @@ def _list_agents(timeout: int = 15) -> List[str]:
         )
     except (subprocess.TimeoutExpired, OSError):
         return []
-
-    agents: List[str] = []
-    for line in result.stdout.splitlines():
-        # Lines look like: "build (subagent)" / "Sisyphus - Ultraworker (primary)".
-        # Strip zero-width spaces opencode uses for indentation, then take the
-        # text before the trailing "(role)" marker.
-        line = line.replace("​", "").strip()
-        if not line or "(" not in line:
-            continue
-        name = line.rsplit("(", 1)[0].strip()
-        if name and name not in agents:
-            agents.append(name)
-    return agents
+    return _parse_agent_list_text(result.stdout)
 
 
 def _omo_installed(agents: Optional[List[str]] = None) -> bool:
-    """Heuristic: is the oh-my-opencode agent harness installed?"""
+    """Heuristic: is an oh-my-opencode (OMO) harness installed?
+
+    Matches the first token of each agent name against the known OMO agent ids,
+    so it works for both the bare ids the JSON path returns and the decorated
+    names the legacy text path returns.
+    """
     if agents is None:
         agents = _list_agents()
-    lowered = " ".join(agents).lower()
-    return any(name in lowered for name in ("sisyphus", "hephaestus", "prometheus"))
+    for name in agents:
+        token = "".join(c if c.isalnum() else " " for c in str(name).lower()).split()
+        if token and token[0] in _OMO_AGENT_IDS:
+            return True
+    return False
 
-
-# ---------------------------------------------------------------------------
-# Input validation
-# ---------------------------------------------------------------------------
 
 def _validate_timeout(value: Any) -> int:
     """Clamp timeout to a safe range."""
